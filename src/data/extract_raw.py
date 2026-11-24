@@ -23,11 +23,14 @@ import math
 import multiprocessing
 import os
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from contextlib import ExitStack
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from time import monotonic
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")    # best effort : silence les logs TF/mediapipe
+os.environ.setdefault("GLOG_minloglevel", "3")
 
 import cv2
 import mediapipe as mp
@@ -252,6 +255,8 @@ def main():
     ap.add_argument("--limit", type=int, help="traiter au plus N vidéos")
     ap.add_argument("--start-frame", type=int, default=0, help="frame de départ par vidéo")
     ap.add_argument("--max-frames", type=int, help="cap de frames par vidéo (test)")
+    ap.add_argument("--heartbeat", type=int, default=60,
+                    help="secondes entre deux lignes de statut pendant l'attente (multi-worker)")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--exclude", action="append", default=["zz-Backup"],
                     help="motif de chemin à ignorer (répétable, défaut: zz-Backup)")
@@ -320,16 +325,31 @@ def main():
                   + (f" | reste ~{el/i*(len(jobs)-i)/60:.1f} min" if i < len(jobs) else ""), flush=True)
     else:
         with ProcessPoolExecutor(args.workers, mp_context=multiprocessing.get_context("spawn")) as pool:
-            pending = {pool.submit(run_job, job): job[2] for job in jobs}
-            for i, future in enumerate(as_completed(pending), 1):
-                n, ns, err, sep_row, sep_col = future.result()
-                frames += n
-                streams += ns
-                failures += bool(err)
-                el = monotonic() - start
-                print(f"[{i}/{len(jobs)}] {pending[future]} | "
-                      + (f"ÉCHEC {err}" if err else f"{n} frames x {ns} flux (sep {sep_row}/{sep_col}) | {frames/el:.0f} f/s")
-                      + (f" | reste ~{el/i*(len(jobs)-i)/60:.1f} min" if i < len(jobs) else ""), flush=True)
+            futures = {pool.submit(run_job, job): job[2] for job in jobs}
+            pending = set(futures)
+            done = 0
+            next_beat = start + args.heartbeat
+            while pending:
+                finished, pending = wait(pending, timeout=30, return_when=FIRST_COMPLETED)
+                for future in finished:
+                    done += 1
+                    n, ns, err, sep_row, sep_col = future.result()
+                    frames += n
+                    streams += ns
+                    failures += bool(err)
+                    el = monotonic() - start
+                    print(f"[{done}/{len(jobs)}] {futures[future]} | "
+                          + (f"ÉCHEC {err}" if err else f"{n} frames x {ns} flux (sep {sep_row}/{sep_col}) | {frames/el:.0f} f/s")
+                          + (f" | reste ~{el/done*(len(jobs)-done)/60:.1f} min" if done < len(jobs) else ""),
+                          flush=True)
+                now = monotonic()
+                if now >= next_beat:
+                    el = now - start
+                    rate = frames / el if el else 0.0
+                    left = el / done * (len(jobs) - done) / 60 if done else float("nan")
+                    print(f"[heartbeat] {done}/{len(jobs)} vidéos terminées | {rate:.1f} f/s | "
+                          f"écoulé {el/60:.0f} min | reste ~{left:.0f} min", flush=True)
+                    next_beat = now + args.heartbeat
     print(f"Terminé : {len(jobs) - failures}/{len(jobs)} vidéos, {streams} flux, {failures} échec(s).", flush=True)
     if failures:
         raise SystemExit(1)
