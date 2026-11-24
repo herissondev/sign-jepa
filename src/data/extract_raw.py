@@ -81,9 +81,12 @@ def stack_frames(frames, default_count):
     return array
 
 
-def make_options(model_path, running_mode, conf):
+def make_options(model_path, running_mode, conf, delegate):
     return mp.tasks.vision.HolisticLandmarkerOptions(
-        base_options=mp.tasks.BaseOptions(model_asset_path=str(model_path)),
+        base_options=mp.tasks.BaseOptions(
+            model_asset_path=str(model_path),
+            delegate=mp.tasks.BaseOptions.Delegate.GPU if delegate == "gpu"
+            else mp.tasks.BaseOptions.Delegate.CPU),
         running_mode=running_mode,
         min_face_detection_confidence=conf["face_detection"],
         min_face_landmarks_confidence=conf["face_landmarks"],
@@ -93,11 +96,29 @@ def make_options(model_path, running_mode, conf):
     )
 
 
+def gpu_works(model_path):
+    """Sonde le delegate GPU sur une petite image ; False -> on retombe sur CPU."""
+    try:
+        import numpy as _np
+        options = make_options(model_path, mp.tasks.vision.RunningMode.IMAGE, DEFAULT_CONF, "gpu")
+        det = mp.tasks.vision.HolisticLandmarker.create_from_options(options)
+        img = mp.Image(image_format=mp.ImageFormat.SRGB, data=_np.zeros((64, 64, 3), _np.uint8))
+        det.detect(img)
+        det.close()
+        return True
+    except Exception:
+        return False
+
+
+DEFAULT_CONF = dict(face_detection=0.5, face_landmarks=0.5, pose_detection=0.5,
+                    pose_landmarks=0.5, hand_landmarks=0.5)
+
+
 # ---------------------------------------------------------------- une vidéo
 def process_video(job):
     """Extrait tous les quadrants d'une vidéo -> un .npz par flux. Retourne (n_frames, n_streams)."""
     (video_path, out_root, rel_video, meta, model_path, conf, views, max_frames,
-     front_fraction, odd_side, start_frame) = job
+     front_fraction, odd_side, start_frame, delegate) = job
     video_path = Path(video_path)
     cap = cv2.VideoCapture(str(video_path))
     with ExitStack() as stack:
@@ -129,7 +150,7 @@ def process_video(job):
         if start_frame:
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)   # on repart du début (ou de --start-frame)
 
-        options = make_options(model_path, mp.tasks.vision.RunningMode.VIDEO, conf)
+        options = make_options(model_path, mp.tasks.vision.RunningMode.VIDEO, conf, delegate)
         tracks = {key: stack.enter_context(mp.tasks.vision.HolisticLandmarker.create_from_options(options))
                   for key in quads}
         records = {key: {} for key in quads}
@@ -189,7 +210,8 @@ def process_video(job):
                 source_video=meta["source_video"], eaf=meta["eaf"],
                 mediapipe_version=mp.__version__,
                 model=Path(model_path).name,
-                options=options_json(**conf, running_mode="VIDEO", views=",".join(views)),
+                options=options_json(**conf, running_mode="VIDEO", views=",".join(views),
+                                     delegate=delegate),
             )
             with NamedTemporaryFile(dir=out_path.parent, suffix=".npz", delete=False) as tmp:
                 temp_path = Path(tmp.name)
@@ -242,6 +264,8 @@ def main():
     ap.add_argument("--min-pose-detection-confidence", type=float, default=0.5)
     ap.add_argument("--min-pose-landmarks-confidence", type=float, default=0.5)
     ap.add_argument("--min-hand-landmarks-confidence", type=float, default=0.5)
+    ap.add_argument("--delegate", choices=("cpu", "gpu"), default="cpu",
+                    help="delegate MediaPipe (gpu = CUDA/Blackwell sur la Spark ; repli auto sur cpu si indisponible)")
     args = ap.parse_args()
 
     if not args.model.is_file():
@@ -254,6 +278,10 @@ def main():
                 pose_detection=args.min_pose_detection_confidence,
                 pose_landmarks=args.min_pose_landmarks_confidence,
                 hand_landmarks=args.min_hand_landmarks_confidence)
+    delegate = args.delegate
+    if delegate == "gpu" and not gpu_works(args.model):
+        print("[WARN] delegate GPU indisponible ici -> repli sur CPU", flush=True)
+        delegate = "cpu"
 
     dataset = args.dataset or args.root.resolve().name
     videos = find_videos(args.root, exclude=args.exclude)
@@ -269,11 +297,12 @@ def main():
             continue
         jobs.append((str(v), str(args.out), rel, video_meta(args.root, v, dataset), str(args.model),
                      conf, views, args.max_frames, args.front_fraction, args.odd_side,
-                     args.start_frame))
+                     args.start_frame, delegate))
     if args.limit:
         jobs = jobs[:args.limit]
     print(f"dataset={dataset} | {len(videos)} vidéos trouvées | {skipped} déjà traitées | "
-          f"{len(jobs)} à traiter | vues={views} | workers={args.workers}", flush=True)
+          f"{len(jobs)} à traiter | vues={views} | workers={args.workers} | delegate={delegate}",
+          flush=True)
     if not jobs:
         return
 
